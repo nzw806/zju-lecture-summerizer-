@@ -47,7 +47,8 @@ def _make_ssl_context():
 SSL_CTX = _make_ssl_context()
 
 BASE = "https://classroom.zju.edu.cn"
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-chat"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
@@ -79,9 +80,27 @@ def parse_url(url):
         "sub_id": sub_id,
         "tenant_code": q.get("tenant_code", ["112"])[0],
     }
+def _direct_selection_id(value, label):
+    value = str(value or "").strip()
+    if not re.fullmatch(r"[0-9]+", value):
+        raise PipelineError(f"直接选择课堂时，{label} 必须是数字 ID")
+    return value
 
 
-# ---------------------------------------------------------------- 字幕抓取
+def resolve_selection(url=None, course_id=None, sub_id=None, tenant_code=None):
+    """兼容旧回放 URL，或直接使用课程/课次 ID。"""
+    if sub_id:
+        if not course_id:
+            raise PipelineError("直接选择课堂时必须同时提供 course_id 和 sub_id")
+        return {
+            "course_id": _direct_selection_id(course_id, "课程 ID"),
+            "sub_id": _direct_selection_id(sub_id, "课次 ID"),
+            "tenant_code": _direct_selection_id(tenant_code or "112", "租户号"),
+        }
+    if not url:
+        raise PipelineError("请提供回放地址，或选择一节课堂")
+    return parse_url(url)
+
 
 def fetch_transcript(sub_id, tenant_code="112", timeout=60):
     """公开接口，无需登录。返回 [(BeginSec, Text), ...] 按时间排序。"""
@@ -328,12 +347,20 @@ def chunk_minutes(minutes, max_chars=11000):
     return chunks
 
 
-# ---------------------------------------------------------------- DeepSeek
+# ---------------------------------------------------------------- OpenAI-compatible API
 
-def deepseek_chat(api_key, system, user, model="deepseek-chat",
-                  max_tokens=4096, retries=5, temperature=0.3):
+def llm_chat(api_key, system, user, model=None,
+             max_tokens=4096, retries=5, temperature=0.3,
+             base_url=None, timeout=300):
+    api_base = (base_url or DEFAULT_BASE_URL).strip().rstrip("/")
+    parsed = urllib.parse.urlparse(api_base)
+    if (parsed.scheme not in ("https", "http") or not parsed.netloc
+            or parsed.query or parsed.fragment or parsed.username or parsed.password):
+        raise PipelineError("AI 接口地址无效，请填写完整的 HTTP(S) Base URL")
+    endpoint = (api_base if api_base.endswith("/chat/completions")
+                else api_base + "/chat/completions")
     body = json.dumps({
-        "model": model,
+        "model": model or DEFAULT_MODEL,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "max_tokens": max_tokens,
@@ -342,40 +369,42 @@ def deepseek_chat(api_key, system, user, model="deepseek-chat",
     }).encode("utf-8")
     last_err = None
     for i in range(retries):
-        req = urllib.request.Request(DEEPSEEK_URL, data=body, method="POST",
+        req = urllib.request.Request(endpoint, data=body, method="POST",
                                      headers={
                                          "Content-Type": "application/json",
                                          "Authorization": f"Bearer {api_key}",
                                          "User-Agent": UA,
                                      })
         try:
-            with urllib.request.urlopen(req, timeout=300,
-                                                context=SSL_CTX) as r:
+            with urllib.request.urlopen(req, timeout=timeout,
+                                        context=ssl.create_default_context()) as r:
                 resp = json.loads(r.read().decode("utf-8"))
             content = resp["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise PipelineError("AI 接口没有返回可用正文，请检查模型及输出额度")
             usage = resp.get("usage", {})
             return content, usage
         except urllib.error.HTTPError as e:
             detail = ""
             try:
-                detail = e.read().decode("utf-8")[:200]
+                detail = e.read().decode("utf-8", "replace").replace(api_key, "[redacted]")[:200]
             except Exception:
                 pass
             last_err = f"HTTP {e.code} {detail}"
             if e.code == 401:
-                raise PipelineError("DeepSeek API key 无效（401），请检查后重填")
+                raise PipelineError("AI API key 无效（401），请检查接口与密钥")
             if e.code == 402:
-                raise PipelineError("DeepSeek 账户余额不足（402），请充值后重试")
+                raise PipelineError("AI 服务额度不足（402），请检查服务商账户")
             if e.code in (429, 500, 502, 503):
                 time.sleep(3 * (i + 1))   # 限流/服务端抖动，退避重试
                 continue
-            raise PipelineError(f"DeepSeek 调用失败：{last_err}")
+            raise PipelineError(f"AI 接口调用失败：{last_err}")
         except PipelineError:
             raise
         except Exception as e:
-            last_err = str(e)
+            last_err = str(e).replace(api_key, "[redacted]")
             time.sleep(3 * (i + 1))
-    raise PipelineError(f"DeepSeek 多次重试仍失败：{last_err}")
+    raise PipelineError(f"AI 接口多次重试仍失败：{last_err}")
 
 
 # ---------------------------------------------------------------- 课件
@@ -462,10 +491,12 @@ MERGE_SYSTEM = (
 
 # ---------------------------------------------------------------- 主流程
 
-def run_pipeline(url, api_key=None, cookie=None, out_root=None, progress=None,
+def run_pipeline(url=None, api_key=None, cookie=None, out_root=None, progress=None,
                  mode="summarize", video_url=None,
                  summary_system=None, courseware_text=None,
-                 extra_requirements=None):
+                 extra_requirements=None, base_url=None, model=None,
+                 course_id=None, sub_id=None, tenant_code=None,
+                 course_name=None, session_name=None):
     """完整流水线。mode: transcript=只抓字幕 / summarize=字幕+总结 /
     enhanced=下载视频→Whisper 重识别→总结。
     总结默认单次请求（一致性好）；超出模型上下文时自动退化为顺序分块+合并。
@@ -475,8 +506,9 @@ def run_pipeline(url, api_key=None, cookie=None, out_root=None, progress=None,
     out_root = out_root or os.path.join(HERE, "output")
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
-    _log(progress, "① 解析回放地址…")
-    info = parse_url(url)
+    direct_selection = bool(sub_id)
+    _log(progress, "① 解析已选择课堂…" if direct_selection else "① 解析回放地址…")
+    info = resolve_selection(url, course_id, sub_id, tenant_code)
     sub_id, tenant = info["sub_id"], info["tenant_code"]
     _log(progress, f"   course_id={info['course_id']}  sub_id={sub_id}")
 
@@ -540,11 +572,13 @@ def run_pipeline(url, api_key=None, cookie=None, out_root=None, progress=None,
 
     if mode == "transcript" or not api_key:
         if mode != "transcript":
-            _log(progress, "注意：未填 DeepSeek API key，本次只抓取不总结。")
+            _log(progress, "注意：未填 AI API key，本次只抓取不总结。")
         _log(progress, f"字幕已保存到：{raw_dir}")
         return {"result_dir": result_dir, "summary_path": None,
                 "transcript_path": os.path.join(raw_dir, "transcript.txt"),
-                "segments": len(segs), "duration": dur, "usage": total_usage}
+                "segments": len(segs), "duration": dur, "usage": total_usage,
+                "course_id": info["course_id"], "sub_id": sub_id,
+                "course_name": course_name or "", "session_name": session_name or ""}
 
     ref = ""
     if courseware_text:
@@ -554,23 +588,28 @@ def run_pipeline(url, api_key=None, cookie=None, out_root=None, progress=None,
     if extra_requirements:
         extra = ("\n\n[用户的额外要求（必须满足，优先级高于上述默认结构）]\n"
                  + extra_requirements)
-    meta = (f"课程：智云课堂回放 sub_id={sub_id}"
+    course_label = course_name or "智云课堂回放"
+    session_label = f"；课堂：{session_name}" if session_name else ""
+    meta = (f"课程：{course_label}{session_label}，sub_id={sub_id}"
             f"（course_id={info['course_id']}），时长约 {dur}")
-    user_full = f"{meta}{ref}\n\n本课完整字幕如下：\n\n{per_min}{extra}"
 
-    _log(progress, "④ 调用 DeepSeek 生成完整讲义（单次请求）…")
+    user_full = f"{meta}{ref}\n\n本课完整字幕如下：\n\n{per_min}{extra}"
+    _log(progress, f"④ 调用 AI 模型 {model or DEFAULT_MODEL} 生成完整讲义（单次请求）…")
     try:
-        final, usage = deepseek_chat(api_key, summary_system, user_full,
-                                     max_tokens=8192)
+        final, usage = llm_chat(api_key, summary_system, user_full,
+                                max_tokens=8192, base_url=base_url, model=model)
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
     except PipelineError as e:
-        if "HTTP 400" not in str(e):
+        detail = str(e).lower()
+        context_errors = ("context_length_exceeded", "maximum context", "context length",
+                          "context window", "too many tokens", "上下文")
+        if "http 400" not in detail or not any(x in detail for x in context_errors):
             raise
         _log(progress, "   单次请求超出模型上下文，退化为顺序分块处理（不并行）…")
         final = _summarize_chunked(
             api_key, minutes, os.path.join(result_dir, "分段笔记"),
-            progress, total_usage)
+            progress, total_usage, base_url=base_url, model=model)
 
     header = (f"# 课程知识总结\n\n"
               f"> 来源：智云课堂回放 sub_id={sub_id}"
@@ -586,10 +625,13 @@ def run_pipeline(url, api_key=None, cookie=None, out_root=None, progress=None,
     _log(progress, f"⑤ 完成。总结已生成，可在界面下载：{summary_path}")
     return {"result_dir": result_dir, "summary_path": summary_path,
             "transcript_path": os.path.join(raw_dir, "transcript.txt"),
-            "segments": len(segs), "duration": dur, "usage": total_usage}
+            "segments": len(segs), "duration": dur, "usage": total_usage,
+            "course_id": info["course_id"], "sub_id": sub_id,
+            "course_name": course_name or "", "session_name": session_name or ""}
 
 
-def _summarize_chunked(api_key, minutes, notes_dir, progress, total_usage):
+def _summarize_chunked(api_key, minutes, notes_dir, progress, total_usage,
+                       base_url=None, model=None):
     """兜底：顺序分块总结 + 合并（不并行，保证与单次请求同样的确定性顺序）。"""
     chunks = chunk_minutes(minutes)
     _log(progress, f"   切成 {len(chunks)} 块，逐块总结…")
@@ -599,7 +641,8 @@ def _summarize_chunked(api_key, minutes, notes_dir, progress, total_usage):
         span = (f"{m0 // 60:02d}:{m0 % 60:02d}"
                 f"–{m1 // 60:02d}:{(m1 + 1) % 60:02d}")
         user = f"课程时段 {span} 的字幕如下：\n\n{text}"
-        content, usage = deepseek_chat(api_key, CHUNK_SYSTEM, user)
+        content, usage = llm_chat(api_key, CHUNK_SYSTEM, user,
+                                  base_url=base_url, model=model)
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
         fn = os.path.join(notes_dir,
@@ -611,8 +654,8 @@ def _summarize_chunked(api_key, minutes, notes_dir, progress, total_usage):
     _log(progress, "   合并分段笔记…")
     merged_input = "\n\n---\n\n".join(
         f"## 第 {i + 1} 段笔记\n\n{n}" for i, n in enumerate(notes))
-    final, usage = deepseek_chat(api_key, MERGE_SYSTEM, merged_input,
-                                 max_tokens=8192)
+    final, usage = llm_chat(api_key, MERGE_SYSTEM, merged_input,
+                            max_tokens=8192, base_url=base_url, model=model)
     total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
     total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
     return final
@@ -624,6 +667,12 @@ if __name__ == "__main__":
     if not u:
         print("用法: python3 pipeline.py <回放URL>")
         sys.exit(1)
-    r = run_pipeline(u)
+    try:
+        with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    r = run_pipeline(u, api_key=cfg.get("api_key"), cookie=cfg.get("cookie"),
+                     base_url=cfg.get("base_url"), model=cfg.get("model"))
     print(json.dumps({k: str(v) for k, v in r.items()}, ensure_ascii=False,
                      indent=1))
