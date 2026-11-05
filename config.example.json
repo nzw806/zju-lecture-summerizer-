@@ -1,1 +1,6 @@
-{"api_key": "", "cookie": ""}
+{
+  "base_url": "https://cpa.qishuxingsec.com/v1",
+  "model": "gpt-6.1-terra",
+  "api_key": "",
+  "cookie": ""
+}
