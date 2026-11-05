@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 rem 双击启动：运行本地服务并自动打开浏览器
 cd /d "%~dp0"
 where python >nul 2>nul

@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-从本机 Microsoft Edge 的 Cookie 数据库里读取指定域名的登录态。
-纯标准库：sqlite3 读库 + 内置 AES-128-CBC 解密（macOS 上 Edge 用 Keychain
-里的 "Microsoft Edge Safe Storage" 密钥加密 Cookie 值）。
-第一次运行 macOS 会弹 Keychain 授权框，点"允许"即可。
+按用户选择只读查询本机 Chrome / Edge 中适用于指定网站的 Cookie。
+仅支持明文及已有的旧版解密方式；新版 Windows AES-GCM / App-Bound
+格式明确提示手动复制，不绕过浏览器保护，也不混合不同配置的登录态。
 """
 import glob
 import hashlib
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
+import time
+from contextlib import closing
+from pathlib import Path
 
 IS_WIN = sys.platform == "win32"
 EDGE_ROOT_MAC = os.path.expanduser(
@@ -21,6 +21,33 @@ EDGE_ROOT_WIN = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                              "Microsoft", "Edge", "User Data")
 KEYCHAIN_SERVICE = "Microsoft Edge Safe Storage"
 KEYCHAIN_ACCOUNT = "Microsoft Edge"
+CHROME_ROOT_MAC = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+CHROME_ROOT_WIN = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                               "Google", "Chrome", "User Data")
+BROWSER_NAMES = {"chrome": "Chrome", "edge": "Edge"}
+TARGET_DOMAIN = "classroom.zju.edu.cn"
+
+
+class CookieReadError(RuntimeError):
+    pass
+
+
+class CookieEncryptionError(CookieReadError):
+    pass
+
+
+def find_cookie_databases(browser):
+    if browser not in BROWSER_NAMES:
+        raise CookieReadError("请选择 Chrome 或 Edge")
+    if IS_WIN:
+        root = CHROME_ROOT_WIN if browser == "chrome" else EDGE_ROOT_WIN
+    elif sys.platform == "darwin":
+        root = CHROME_ROOT_MAC if browser == "chrome" else EDGE_ROOT_MAC
+    else:
+        raise CookieReadError("自动读取目前仅支持 Windows 和 macOS，请手动复制 Cookie")
+    dbs = (glob.glob(os.path.join(root, "*", "Network", "Cookies"))
+           + glob.glob(os.path.join(root, "*", "Cookies")))
+    return sorted(dict.fromkeys(dbs), key=lambda p: ("Default" not in Path(p).parts, p))
 
 
 # --------------------------------------------------------------- AES-128
@@ -118,15 +145,17 @@ def aes128_cbc_decrypt(key, iv, data):
 
 # --------------------------------------------------------------- Edge 读取
 
-def _keychain_password():
-    """从 macOS Keychain 取 Edge 的 Cookie 加密主密码（首次会弹授权框）。"""
+def _keychain_password(browser="edge"):
+    """macOS 通过系统授权读取所选浏览器的 Safe Storage 密钥。"""
+    service = "Chrome Safe Storage" if browser == "chrome" else KEYCHAIN_SERVICE
+    account = "Chrome" if browser == "chrome" else KEYCHAIN_ACCOUNT
     r = subprocess.run(
         ["security", "find-generic-password", "-w",
-         "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT],
+         "-s", service, "-a", account],
         capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(
-            "无法从钥匙串读取 Edge 密钥（可能点了拒绝）。"
+            "无法从钥匙串读取所选浏览器密钥（可能点了拒绝）。"
             "请重试并在弹窗中选择『允许』；或改用手动粘贴 Cookie。")
     return r.stdout.rstrip("\n")
 
@@ -152,73 +181,98 @@ def _dpapi_decrypt(data):
     return res
 
 
-def _decrypt_value(raw, key):
-    if raw[:3] in (b"v10", b"v20"):
-        if IS_WIN:                            # Windows：DPAPI
-            return _dpapi_decrypt(raw).decode("utf-8", "replace")
-        # macOS：Keychain 主密码 + PBKDF2 + AES-128-CBC
-        dk = hashlib.pbkdf2_hmac("sha1", key.encode("utf-8"),
-                                 b"saltysalt", 1003, 16)
-        return aes128_cbc_decrypt(dk, b" " * 16, raw[3:]).decode("utf-8",
-                                                                 "replace")
-    return raw.decode("utf-8", "replace")     # 未加密（少见）
-
-
-def read_edge_cookies(domain="zju.edu.cn"):
-    """读取 Edge 里属于 domain（含子域）的所有 Cookie，拼成请求头字符串。"""
+def _decrypt_value(raw, key, host=""):
+    raw = bytes(raw)
     if IS_WIN:
-        # 新版 Edge 的 Cookie 库在 Network 子目录，旧版直接在配置目录下
-        dbs = (glob.glob(os.path.join(EDGE_ROOT_WIN, "*", "Network", "Cookies"))
-               + glob.glob(os.path.join(EDGE_ROOT_WIN, "*", "Cookies")))
-        if not dbs:
-            raise RuntimeError("没找到 Edge 的 Cookie 数据库，请确认已安装 Edge")
-        key = None                            # Windows 不需要 Keychain
-    else:
-        dbs = glob.glob(os.path.join(EDGE_ROOT_MAC, "*", "Cookies"))
-        if not dbs:
-            raise RuntimeError(
-                "没找到 Edge 的 Cookie 数据库。若提示权限不足，请到 "
-                "系统设置 → 隐私与安全性 → 完全磁盘访问权限，把终端（或 python）加进去；"
-                "或改用手动粘贴 Cookie。")
-        key = _keychain_password()
-    pairs = []
-    seen = set()
+        if raw.startswith(b"v20"):
+            raise CookieEncryptionError("浏览器使用应用绑定加密（v20），本工具无法自动解密，请按下方步骤手动复制 Cookie")
+        if raw[:3] in (b"v10", b"v11"):
+            raise CookieEncryptionError("浏览器使用新版 AES-GCM Cookie 加密，本工具暂不支持，请按下方步骤手动复制 Cookie")
+        return _dpapi_decrypt(raw).decode("utf-8")
+    if raw[:3] in (b"v10", b"v11"):
+        dk = hashlib.pbkdf2_hmac("sha1", key.encode("utf-8"), b"saltysalt", 1003, 16)
+        value = aes128_cbc_decrypt(dk, b" " * 16, raw[3:])
+        # Chromium cookie DB v24+ binds encrypted values to host_key.
+        prefix = hashlib.sha256(host.encode("utf-8")).digest()
+        if host and value.startswith(prefix):
+            value = value[len(prefix):]
+        return value.decode("utf-8")
+    if raw.startswith(b"v20"):
+        raise CookieEncryptionError("不支持此 Cookie 加密格式，请手动复制 Cookie")
+    return raw.decode("utf-8")
+
+
+def _cookie_hosts(domain):
+    # For classroom.zju.edu.cn, parent-domain cookies apply, but authserver,
+    # unrelated zju subdomains, and suffix lookalikes must never be queried.
+    domain = domain.lower().lstrip(".").rstrip(".")
+    if domain != TARGET_DOMAIN:
+        raise CookieReadError("自动读取仅限智云课堂 classroom.zju.edu.cn")
+    return [domain, "." + domain, ".zju.edu.cn"]
+
+
+def _read_cookie_rows(db, domain):
+    hosts = _cookie_hosts(domain)
+    placeholders = ",".join("?" for _ in hosts)
+    now = int((time.time() + 11644473600) * 1000000)
+    # Read the real DB with its WAL, without copying all browser cookies,
+    # disabling browser protection, or using immutable/stale snapshots.
+    uri = Path(db).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=1)) as con:
+        return con.execute(
+            "SELECT host_key, name, encrypted_value, value FROM cookies "
+            f"WHERE host_key IN ({placeholders}) "
+            "AND (expires_utc = 0 OR expires_utc > ?) ORDER BY length(host_key) DESC",
+            (*hosts, now)).fetchall()
+
+
+def read_browser_cookies(browser="chrome", domain=TARGET_DOMAIN):
+    _cookie_hosts(domain)
+    dbs = find_cookie_databases(browser)
+    label = BROWSER_NAMES[browser]
+    if not dbs:
+        raise CookieReadError(f"没找到 {label} 的 Cookie 数据库，请确认浏览器及其用户配置；也可手动复制 Cookie")
+    blocked = False
     for db in dbs:
-        tmp = tempfile.mktemp(suffix=".cookies")
         try:
-            shutil.copy2(db, tmp)               # Edge 运行中数据库被锁，先拷出来
-            con = sqlite3.connect(tmp)
-            rows = con.execute(
-                "SELECT host_key, name, encrypted_value, value FROM cookies"
-                " WHERE host_key LIKE ?", ("%" + domain,)).fetchall()
-            con.close()
-        except sqlite3.Error as e:
-            raise RuntimeError(f"读取 Cookie 数据库失败：{e}")
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            rows = _read_cookie_rows(db, domain)
+        except (OSError, sqlite3.Error):
+            blocked = True
+            continue
+        if not rows:
+            continue
+        key = None
+        if not IS_WIN and any(enc and not plain for _, _, enc, plain in rows):
+            key = _keychain_password(browser)
+        pairs, seen = [], set()
         for host, name, enc, plain in rows:
-            val = plain or ""
-            if enc:
-                try:
-                    val = _decrypt_value(enc, key)
-                except Exception:
-                    continue
-            if (host, name) in seen or not val:
+            try:
+                val = plain or (_decrypt_value(enc, key, host) if enc else "")
+            except CookieEncryptionError as e:
+                raise CookieReadError(f"{label}：{e}") from None
+            except Exception:
+                raise CookieReadError(f"无法解密 {label} 的登录态，请手动复制 Cookie；不会返回不完整的登录信息") from None
+            if not val or name in seen:
                 continue
-            seen.add((host, name))
+            if any(c in name + val for c in "\r\n"):
+                raise CookieReadError("Cookie 包含无效控制字符，请手动复制 Cookie")
+            seen.add(name)
             pairs.append(f"{name}={val}")
-    if not pairs:
-        raise RuntimeError(
-            f"Edge 里没有 {domain} 的 Cookie——请先在 Edge 里登录智云课堂")
-    return "; ".join(pairs)
+        if pairs:
+            return "; ".join(pairs)  # Never combine separate browser profiles.
+    if blocked:
+        raise CookieReadError(
+            f"{label} 正在保护或占用 Cookie 数据库（或当前用户无权读取）。"
+            "建议直接按下方步骤手动复制；也可自行完全退出该浏览器后再试，"
+            "但新版加密仍可能不支持。程序不会自动关闭浏览器。")
+    raise CookieReadError(f"{label} 中没有可用的智云课堂 Cookie，请在该浏览器登录后刷新课堂页面，或手动复制 Cookie")
+
+
+def read_edge_cookies(domain=TARGET_DOMAIN):
+    return read_browser_cookies("edge", domain)
 
 
 if __name__ == "__main__":
-    import sys
-    d = sys.argv[1] if len(sys.argv) > 1 else "zju.edu.cn"
-    c = read_edge_cookies(d)
-    print(f"共 {c.count('=')} 个 Cookie，总长 {len(c)} 字符")
-    print(c[:120] + "…")
+    browser = sys.argv[1] if len(sys.argv) > 1 else "chrome"
+    cookie = read_browser_cookies(browser)
+    print(f"读取完成：{len(cookie.split('; '))} 个 Cookie（不输出登录凭证）")
