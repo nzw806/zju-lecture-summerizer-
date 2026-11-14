@@ -4,7 +4,6 @@
 双击 start.command / start.bat / start.sh，或运行: python3 app.py
 然后浏览器打开 http://127.0.0.1:8765
 """
-import glob
 import json
 import os
 import re
@@ -19,7 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
 import pipeline
-import browser_cookies
+import secure_store
+import zju_login
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -29,6 +29,8 @@ JOBS = {}          # job_id -> {state, logs, result, error}
 JOBS_LOCK = threading.Lock()
 JOB_COUNTER = [0]
 FF = {"state": "idle", "logs": [], "error": None, "path": None}
+LOGIN = {"state": "idle", "logs": [], "error": None, "name": None}
+LOGIN_LOCK = threading.Lock()
 UPLOADS = {}       # upload_id -> {name, text, chars}
 UPLOAD_COUNTER = [0]
 
@@ -44,11 +46,48 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=1)
-    os.chmod(CONFIG_PATH, 0o600)   # 里面存 key 和 cookie，仅限本人可读
+    os.chmod(CONFIG_PATH, 0o600)   # 仅限本人可读
+
+
+def load_provider():
+    """读取已保存的 API 服务商配置；没有则用默认 DeepSeek。"""
+    raw = secure_store.load_api_config()
+    if raw:
+        try:
+            p = json.loads(raw)
+            if isinstance(p, dict) and p.get("id") in pipeline.PROVIDERS:
+                return p
+        except Exception:
+            pass
+    return {"id": "deepseek"}
+
+
+def migrate_secrets():
+    """一次性迁移：把 config.json 里遗留的明文 key/cookie 搬进系统钥匙串，
+    然后从 config.json 抹除——此后项目目录里不再有任何明文密钥。"""
+    cfg = load_config()
+    dirty = False
+    for field, save in (("api_key", secure_store.save_api_key),
+                        ("cookie", secure_store.save_cookie)):
+        val = (cfg.get(field) or "").strip()
+        if val:
+            try:
+                save(val)
+            except Exception as e:
+                print(f"迁移 {field} 到钥匙串失败（保留在 config.json）：{e}")
+                continue
+        if field in cfg:
+            cfg.pop(field)
+            dirty = True
+    if dirty:
+        save_config(cfg)
+        print("已把 config.json 里的明文密钥迁移进系统钥匙串，"
+              "config.json 不再保存任何密钥。")
 
 
 def run_job(job_id, url, api_key, cookie, mode, video_url,
-            summary_prompt, upload_id, extra_requirements):
+            summary_prompt, upload_id, extra_requirements, provider=None,
+            fetch_ppt=True):
     def progress(msg):
         with JOBS_LOCK:
             JOBS[job_id]["logs"].append(msg)
@@ -60,7 +99,8 @@ def run_job(job_id, url, api_key, cookie, mode, video_url,
             progress=progress, mode=mode, video_url=video_url or None,
             summary_system=summary_prompt or None,
             courseware_text=courseware,
-            extra_requirements=extra_requirements or None)
+            extra_requirements=extra_requirements or None,
+            provider=provider or None, fetch_ppt=fetch_ppt)
         with JOBS_LOCK:
             JOBS[job_id].update(state="done", result=result)
     except Exception as e:
@@ -80,6 +120,22 @@ def ff_job():
         FF.update(state="error", error=str(e))
 
 
+def login_job(force=False):
+    """后台线程：弹出内置浏览器登录，成功后把 Cookie 存进钥匙串。"""
+    def log(m):
+        with LOGIN_LOCK:
+            LOGIN["logs"].append(m)
+    try:
+        cookie, info = zju_login.ensure_login(force=force, progress=log)
+        with LOGIN_LOCK:
+            LOGIN.update(state="done", error=None,
+                         name=info.get("name") or info.get("id"))
+    except Exception as e:
+        with LOGIN_LOCK:
+            LOGIN["logs"].append(str(e))
+            LOGIN.update(state="error", error=str(e))
+
+
 PAGE = """<!doctype html>
 <html lang="zh">
 <head>
@@ -97,16 +153,23 @@ PAGE = """<!doctype html>
   h1 { font-size:23px; margin:0 0 2px; font-weight:700; letter-spacing:.5px; }
   h1 .bar { display:inline-block; width:5px; height:20px; background:var(--gold);
             border-radius:2px; margin-right:10px; vertical-align:-2px; }
-  .sub { color:var(--dim); font-size:13px; margin-bottom:26px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }
+  #logincard { border-left:5px solid var(--gold); }
+  #logincard.ok { border-left-color:var(--ok); background:#f3f9f4; }
+  .lc-row { display:flex; justify-content:space-between; align-items:center;
+            gap:14px; flex-wrap:wrap; }
+  .lc-title { font-size:17px; font-weight:700; letter-spacing:.5px; }
+  #logincard.ok .lc-title { color:var(--ok); }
+  .lc-btns { display:flex; gap:10px; align-items:center; }
   .card { background:var(--card); border:1px solid var(--line);
           border-radius:10px; padding:22px; margin-bottom:16px;
           box-shadow:0 1px 3px rgba(120,100,40,.06); }
   label { display:block; font-size:13px; font-weight:600; margin:16px 0 6px; }
   label:first-child { margin-top:0; }
-  input[type=text], input[type=password], textarea {
+  input[type=text], input[type=password], select, textarea {
     width:100%; padding:10px 12px; font-size:14px; border:1px solid var(--line);
     border-radius:7px; background:#fffefb; outline:none; color:var(--text); }
-  input:focus, textarea:focus { border-color:var(--gold); }
+  input:focus, select:focus, textarea:focus { border-color:var(--gold); }
   textarea { resize:vertical; min-height:54px; font-family:ui-monospace,Menlo,
              Consolas,monospace; font-size:12px; line-height:1.6; }
   .hint { font-size:12px; color:var(--dim); margin-top:5px; line-height:1.7; }
@@ -161,6 +224,21 @@ PAGE = """<!doctype html>
   <h1><span class="bar"></span>智云课堂 · 课程总结</h1>
   <div class="sub">粘贴回放地址，自动抓取课堂内容并生成带时间戳的知识总结</div>
 
+  <div class="card" id="logincard">
+    <div class="lc-row">
+      <div>
+        <div class="lc-title" id="lctitle">未登录</div>
+        <div class="hint" id="lcdesc">平台已要求登录：字幕、PPT、视频直链均需登录态。
+          点右侧按钮登录一次（弹窗中输浙大账号），登录态安全存于系统钥匙串，之后自动复用。</div>
+      </div>
+      <div class="lc-btns">
+        <button type="button" id="login">登录智云课堂</button>
+        <button type="button" id="logout" class="sec">清除登录态</button>
+      </div>
+    </div>
+    <div class="hint" id="lcstate" style="margin-top:8px"></div>
+  </div>
+
   <div class="card">
     <div class="row" style="margin:0 0 4px">
       <button type="button" id="diag" class="sec">环境自检</button>
@@ -178,7 +256,7 @@ PAGE = """<!doctype html>
     <label>总结模式</label>
     <div class="modes">
       <label><input type="radio" name="mode" value="transcript">
-        <span>只抓字幕<span class="d">不消耗额度，产出带时间戳的字幕全文；无需 API key</span></span>
+        <span>只抓字幕<span class="d">不消耗额度，产出带时间戳的字幕全文；需登录，无需 API key</span></span>
       </label>
       <label><input type="radio" name="mode" value="summarize" checked>
         <span>字幕 + AI 总结<span class="d">默认模式：平台字幕经 DeepSeek 分段整理成讲义，3–5 分钟</span></span>
@@ -188,6 +266,10 @@ PAGE = """<!doctype html>
         专门改善口音重、平台字幕术语识别不准的问题；较慢，需 API key 与 ffmpeg</span></span>
       </label>
     </div>
+
+    <label class="ck" style="margin-top:12px">
+      <input type="checkbox" id="fetchppt" checked>
+      抓取课件 PPT（下载幻灯片图片 + 视觉转写）——不勾可省 token，只做字幕总结</label>
 
     <div id="mode3box">
       <label style="margin-top:0">视频直链（可选）</label>
@@ -203,35 +285,42 @@ PAGE = """<!doctype html>
         识别时会自动带入课程术语提示，减少专业词汇识别错误。</div>
     </div>
 
-    <label>DeepSeek API Key</label>
-    <input type="password" id="apikey" placeholder="sk-...（「只抓字幕」模式可留空）">
-    <label class="ck"><input type="checkbox" id="savekey" checked>
-      在本机记住 key 与 cookie（config.json，仅本人可读）</label>
-
-    <label>Cookie（可选）
-      <a class="plain" href="https://classroom.zju.edu.cn/" target="_blank">
-        打开智云课堂登录页</a></label>
-    <div class="row" style="margin-top:0">
-      <button type="button" id="autocookie" class="sec">自动读取 Edge 登录态</button>
-      <span class="hint" id="ckstate"></span>
+    <label>AI 服务商</label>
+    <select id="provider"></select>
+    <div id="custombox" style="display:none">
+      <label>接口地址（完整 /chat/completions URL）</label>
+      <input type="text" id="custombase"
+        placeholder="https://your-api.example.com/v1/chat/completions">
+      <label>文本模型</label>
+      <input type="text" id="customchat" placeholder="模型名，如 qwen-plus">
+      <label>视觉模型（PPT 转写用，留空=同文本模型）</label>
+      <input type="text" id="customvision" placeholder="模型名，如 qwen-vl-plus">
     </div>
-    <textarea id="cookie"
-      placeholder="或手动粘贴：浏览器 F12 → Network → 任一 classroom.zju.edu.cn 请求头里的 Cookie 整行"></textarea>
-    <details><summary>自动读取失败时的手动获取方法</summary>
-      <div class="hint">① 点上方「打开智云课堂登录页」在 Edge 里登录；② 按 <b>F12</b> →
-      标签栏 <b>＋</b> → <b>网络（Network）</b>；③ <b>F5</b> 刷新，点任一
-      <b>classroom.zju.edu.cn</b> 请求；④ 右侧 <b>请求标头</b> 里 <b>Cookie:</b> 一行
-      <b>右键 → 复制值</b>。Cookie 只用于获取视频直链与 PPT 文字层，不填也能总结。</div>
+
+    <label>API Key</label>
+    <input type="password" id="apikey" placeholder="sk-…（存入系统钥匙串，不落明文文件）">
+    <div class="hint">支持任意 OpenAI 兼容接口：DeepSeek / 智谱 GLM / 通义千问 / OpenAI，或自定义端点。
+      PPT 视觉转写需要所选服务商有**视觉模型**；没有时会跳过转写、只存图片。</div>
+    <label class="ck"><input type="checkbox" id="savekey" checked>
+      记住 API key 与服务商（加密存于系统钥匙串，仅本人可读）</label>
+
+    <details><summary>不便弹窗登录？手动粘贴 Cookie（兜底，仅本次运行有效）</summary>
+      <textarea id="cookie" style="margin-top:8px"
+        placeholder="浏览器 F12 → Network → 任一 classroom.zju.edu.cn 请求头里的 Cookie 整行"></textarea>
+      <div class="hint">① 在任意浏览器登录智云课堂；② 按 <b>F12</b> →
+      <b>网络（Network）</b>；③ <b>F5</b> 刷新，点任一 <b>classroom.zju.edu.cn</b>
+      请求；④ 右侧 <b>请求标头</b> 里 <b>Cookie:</b> 一行 <b>右键 → 复制值</b>，粘到上面。
+      手动粘贴的 Cookie 仅本次运行使用、优先于钥匙串。</div>
     </details>
 
     <label>参考课件（可选）</label>
     <div class="row" style="margin-top:0">
-      <input type="file" id="cwfile" accept=".pptx,.docx,.txt,.md"
+      <input type="file" id="cwfile" accept=".pptx,.docx,.pdf,.txt,.md"
         style="flex:1;min-width:200px;font-size:13px">
       <button type="button" id="upload" class="sec">上传课件</button>
     </div>
-    <div class="hint" id="cwstate">支持 pptx / docx / txt / md。上传后提取文字，
-      作为术语与章节结构参考注入总结，帮助抓住重点、纠正识别错误。</div>
+    <div class="hint" id="cwstate">支持 pptx / docx / pdf / txt / md（PDF 需含文字层，
+      扫描件建议先转文字）。上传后提取文字，作为术语与章节结构参考注入总结。</div>
 
     <label>额外要求（可选）</label>
     <textarea id="extra" rows="3"
@@ -263,10 +352,42 @@ PAGE = """<!doctype html>
 <script>
 let timer = null, jobId = null, uploadId = '';
 
+function applyProvider(p){
+  p = p || {};
+  document.getElementById('provider').value = p.id || 'deepseek';
+  document.getElementById('custombase').value = p.base || '';
+  document.getElementById('customchat').value = p.chat || '';
+  document.getElementById('customvision').value = p.vision || '';
+  document.getElementById('custombox').style.display =
+    (p.id === 'custom') ? 'block' : 'none';
+}
+
+function getProvider(){
+  const id = document.getElementById('provider').value;
+  const custom = id === 'custom';
+  return {
+    id,
+    base: custom ? document.getElementById('custombase').value.trim() : '',
+    chat: custom ? document.getElementById('customchat').value.trim() : '',
+    vision: custom ? document.getElementById('customvision').value.trim() : '',
+  };
+}
+
 fetch('/api/config').then(r=>r.json()).then(c=>{
-  if (c.api_key) document.getElementById('apikey').value = c.api_key;
-  if (c.cookie)  document.getElementById('cookie').value = c.cookie;
+  const sel = document.getElementById('provider');
+  sel.innerHTML = (c.providers || []).map(p =>
+    '<option value="'+p.id+'">'+p.label+'</option>').join('');
+  applyProvider(c.provider);
+  if (c.has_api_key){
+    document.getElementById('apikey').placeholder =
+      '已保存 ' + c.key_hint + '（系统钥匙串）— 留空沿用，输入新值可覆盖';
+  }
+  sel.onchange = () => {
+    document.getElementById('custombox').style.display =
+      sel.value === 'custom' ? 'block' : 'none';
+  };
 });
+refreshLogin();
 fetch('/api/prompts').then(r=>r.json()).then(p=>{
   document.getElementById('sump').value = p.summary;
 });
@@ -303,22 +424,67 @@ document.getElementById('getff').onclick = async () => {
   }, 1500);
 };
 
-document.getElementById('autocookie').onclick = async () => {
-  const btn = document.getElementById('autocookie');
-  const st = document.getElementById('ckstate');
-  btn.disabled = true;
-  st.textContent = '读取中…（首次会弹系统授权框，请点"允许"）';
+let loggedIn = false;
+
+function updateGoBtn(){
+  const go = document.getElementById('go');
+  const manual = document.getElementById('cookie').value.trim();
+  go.disabled = !loggedIn && !manual;
+  if (go.disabled) setState('请先完成上方「登录智云课堂」，再开始运行');
+  else setState('');
+}
+
+async function refreshLogin(){
+  const card = document.getElementById('logincard');
+  const title = document.getElementById('lctitle');
+  const desc = document.getElementById('lcdesc');
   try {
-    const r = await fetch('/api/autocookie');
-    const j = await r.json();
-    if (j.error){ st.innerHTML = '<span class="no">失败</span>：' + j.error; }
-    else {
-      document.getElementById('cookie').value = j.cookie;
-      st.innerHTML = '<span class="ok">已读取 ' + j.count + ' 个 Cookie</span>';
+    const j = await (await fetch('/api/login-status')).json();
+    loggedIn = !!j.has_login;
+    if (loggedIn){
+      card.classList.add('ok');
+      title.textContent = '已登录' + (j.name ? '：' + j.name : '');
+      desc.textContent = '登录态存于' + (j.backend||'系统钥匙串')
+        + '，之后自动复用；过期时重新点一次「登录智云课堂」即可。';
+    } else {
+      card.classList.remove('ok');
+      title.textContent = '未登录 — 必须登录才能运行';
+      desc.innerHTML = '平台已要求登录：<b>字幕、PPT、视频直链</b>均需登录态。'
+        + '点右侧「登录智云课堂」，在弹出的窗口中（确认地址栏为 zju.edu.cn 官方域）'
+        + '输浙大账号完成一次登录；登录态安全存于系统钥匙串，不上传、可随时清除。';
     }
-  } catch(e){ st.innerHTML = '<span class="no">' + e + '</span>'; }
-  btn.disabled = false;
+  } catch(e){}
+  updateGoBtn();
+}
+
+let loginTimer = null;
+document.getElementById('login').onclick = async () => {
+  const btn = document.getElementById('login');
+  const st = document.getElementById('lcstate');
+  btn.disabled = true;
+  st.textContent = '正在打开登录窗口…（首次会弹钥匙串授权框，请点"允许"）';
+  await fetch('/api/login', {method:'POST'});
+  loginTimer = setInterval(async ()=>{
+    const j = await (await fetch('/api/login-status')).json();
+    if (j.login_state === 'running'){
+      st.textContent = '登录中… ' + (j.login_logs && j.login_logs.slice(-1)[0] || '');
+      return;
+    }
+    clearInterval(loginTimer);
+    btn.disabled = false;
+    st.textContent = j.login_state === 'error'
+      ? ('登录失败：' + (j.login_error||'')) : '';
+    await refreshLogin();
+  }, 1500);
 };
+
+document.getElementById('logout').onclick = async () => {
+  await fetch('/api/logout', {method:'POST'});
+  document.getElementById('cookie').value = '';
+  await refreshLogin();
+};
+
+document.getElementById('cookie').oninput = updateGoBtn;
 
 document.getElementById('upload').onclick = async () => {
   const f = document.getElementById('cwfile').files[0];
@@ -342,7 +508,7 @@ document.getElementById('upload').onclick = async () => {
 };
 
 const DIAG_LABELS = {python:'Python 版本', zju:'智云课堂连通性',
-  deepseek:'DeepSeek key', edge:'Edge 登录态', ffmpeg:'ffmpeg'};
+  deepseek:'AI key', login:'智云登录态', ffmpeg:'ffmpeg'};
 document.getElementById('diag').onclick = async () => {
   const box = document.getElementById('diagbox');
   box.style.display = 'block'; box.textContent = '检查中…';
@@ -359,11 +525,15 @@ document.getElementById('diag').onclick = async () => {
 document.getElementById('go').onclick = async () => {
   const url = document.getElementById('url').value.trim();
   if (!url){ setState('请先粘贴回放地址'); return; }
+  if (!loggedIn && !document.getElementById('cookie').value.trim()){
+    setState('平台已要求登录：请先点上方「登录智云课堂」'); return; }
   const body = {
     url,
     mode: mode(),
+    fetch_ppt: document.getElementById('fetchppt').checked,
     video_url: document.getElementById('videourl').value.trim(),
     api_key: document.getElementById('apikey').value.trim(),
+    provider: getProvider(),
     cookie:  document.getElementById('cookie').value.trim(),
     save:    document.getElementById('savekey').checked,
     summary_prompt: document.getElementById('sump').value.trim(),
@@ -408,7 +578,9 @@ async function poll(){
         + '<a href="/api/download?job='+jobId+'&what=zip"><button class="sec">下载全部资料（zip）</button></a>'
         + '<a class="plain" href="/api/file?job='+jobId+'" target="_blank">在线预览</a>';
       note.textContent = '共 ' + (res.segments||'') + ' 段字幕，时长约 '
-        + (res.duration||'') + '；token 消耗：输入 '
+        + (res.duration||'')
+        + (res.slide_count ? '；PPT ' + res.slide_count + ' 页（在 zip 的 ppt/ 目录）' : '')
+        + '；token 消耗：输入 '
         + ((res.usage||{}).prompt_tokens||0) + '，输出 '
         + ((res.usage||{}).completion_tokens||0);
     } else {
@@ -461,34 +633,41 @@ class Handler(BaseHTTPRequestHandler):
             checks["zju"] = {"ok": True, "detail": "智云课堂可访问"}
         except Exception as e:
             checks["zju"] = {"ok": False, "detail": f"无法访问：{e}"}
-        key = load_config().get("api_key", "")
+        key = secure_store.load_api_key() or ""
         if not key:
             checks["deepseek"] = {"ok": None,
-                                  "detail": "未配置 key（「只抓字幕」可用；"
-                                            "总结模式需要 key）"}
+                                  "detail": "未配置 key（存于系统钥匙串；"
+                                            "总结模式需要，在下方填一次即可）"}
         else:
+            prov = load_provider()
+            base, chat, vis = pipeline.resolve_api(prov)
+            label = pipeline.PROVIDERS.get(prov.get("id"), {}).get(
+                "label", prov.get("id"))
             try:
                 pipeline.deepseek_chat(key, "你是助手", "只回复：ok",
-                                       max_tokens=5)
-                checks["deepseek"] = {"ok": True, "detail": "key 有效，可正常总结"}
+                                       max_tokens=10, base_url=base,
+                                       model=chat)
+                checks["deepseek"] = {"ok": True,
+                                      "detail": f"key 有效（{label} · {chat}），"
+                                                "可正常总结"}
             except Exception as e:
                 checks["deepseek"] = {"ok": False, "detail": str(e)}
-        if browser_cookies.IS_WIN:
-            dbs = (glob.glob(os.path.join(browser_cookies.EDGE_ROOT_WIN,
-                                          "*", "Network", "Cookies"))
-                   + glob.glob(os.path.join(browser_cookies.EDGE_ROOT_WIN,
-                                            "*", "Cookies")))
+        ck = secure_store.load_cookie()
+        if ck:
+            info = zju_login.validate_cookie(ck)
+            if info:
+                checks["login"] = {
+                    "ok": True,
+                    "detail": f"已登录（{info.get('name') or info['id']}），"
+                              f"存于{secure_store.backend_name()}，可抓 PPT/视频直链"}
+            else:
+                checks["login"] = {"ok": False,
+                                   "detail": "钥匙串里的登录态已失效，请重新点「登录」"}
         else:
-            dbs = glob.glob(os.path.join(browser_cookies.EDGE_ROOT_MAC,
-                                         "*", "Cookies"))
-        if dbs:
-            checks["edge"] = {"ok": True,
-                              "detail": f"找到 Edge 数据（{len(dbs)} 个配置），"
-                                        "点「自动读取」时才请求解密授权"}
-        else:
-            checks["edge"] = {"ok": None,
-                              "detail": "未找到 Edge 数据（不影响字幕总结；"
-                                        "增强模式的视频直链与 PPT 需手动提供）"}
+            checks["login"] = {
+                "ok": None,
+                "detail": "未登录（不影响字幕总结；点「登录智云课堂」后可抓 PPT 图片"
+                          "与视频直链）"}
         ff = pipeline.ffmpeg_path()
         if ff:
             checks["ffmpeg"] = {"ok": True, "detail": f"已就绪：{ff}"}
@@ -507,9 +686,30 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
         elif u.path == "/api/config":
-            cfg = load_config()
-            self._json({"api_key": cfg.get("api_key", ""),
-                        "cookie": cfg.get("cookie", "")})
+            key = secure_store.load_api_key() or ""
+            self._json({
+                "has_api_key": bool(key),
+                "key_hint": (key[:5] + "…" + key[-4:]) if key else "",
+                "providers": [{"id": k, "label": v["label"]}
+                              for k, v in pipeline.PROVIDERS.items()],
+                "provider": load_provider()})
+        elif u.path == "/api/login-status":
+            ck = secure_store.load_cookie()
+            name = None
+            if ck:
+                info = zju_login.validate_cookie(ck)
+                name = (info or {}).get("name") or (info or {}).get("id")
+                if not info:      # 钥匙串里有但已失效
+                    ck = None
+            with LOGIN_LOCK:
+                lst, lerr = LOGIN["state"], LOGIN["error"]
+                llogs = list(LOGIN["logs"])[-3:]
+                lname = LOGIN.get("name")
+            self._json({"has_login": bool(ck),
+                        "name": name or (lname if lst == "done" else None),
+                        "backend": secure_store.backend_name(),
+                        "login_state": lst, "login_error": lerr,
+                        "login_logs": llogs})
         elif u.path == "/api/prompts":
             self._json({"summary": pipeline.SUMMARY_SYSTEM})
         elif u.path == "/api/ffmpeg-status":
@@ -518,12 +718,6 @@ class Handler(BaseHTTPRequestHandler):
                         "path": FF["path"] or pipeline.ffmpeg_path()})
         elif u.path == "/api/diagnose":
             self._json(self._diagnose())
-        elif u.path == "/api/autocookie":
-            try:
-                cookie = browser_cookies.read_edge_cookies("zju.edu.cn")
-                self._json({"cookie": cookie, "count": cookie.count("=")})
-            except Exception as e:
-                self._json({"error": str(e)}, 500)
         elif u.path == "/api/status":
             jid = q.get("job", [""])[0]
             with JOBS_LOCK:
@@ -646,6 +840,25 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=ff_job, daemon=True).start()
             self._json({"ok": True})
             return
+        if u.path == "/api/login":
+            with LOGIN_LOCK:
+                if LOGIN["state"] == "running":
+                    self._json({"error": "已在登录中"})
+                    return
+                LOGIN.update(state="running", logs=[], error=None, name=None)
+            force = bool(json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length", 0))
+                                or 0) or b"{}").get("force"))
+            threading.Thread(target=login_job, args=(force,),
+                             daemon=True).start()
+            self._json({"ok": True})
+            return
+        if u.path == "/api/logout":
+            secure_store.clear_cookie()
+            with LOGIN_LOCK:
+                LOGIN.update(state="idle", logs=[], error=None, name=None)
+            self._json({"ok": True})
+            return
         if u.path != "/api/run":
             self._json({"error": "not found"}, 404)
             return
@@ -664,9 +877,31 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "未知模式"}, 400)
             return
         api_key = (body.get("api_key") or "").strip()
-        cookie = (body.get("cookie") or "").strip()
+        if not api_key:                     # 未填则沿用钥匙串里存的
+            api_key = secure_store.load_api_key() or ""
+        provider = body.get("provider") or {}
+        pid = provider.get("id") or "deepseek"
+        if pid not in pipeline.PROVIDERS:
+            self._json({"error": f"未知的 AI 服务商：{pid}"}, 400)
+            return
+        if pid == "custom" and not ((provider.get("base") or "").strip()
+                                    and (provider.get("chat") or "").strip()):
+            self._json({"error": "自定义服务商需要填写接口地址和文本模型名"}, 400)
+            return
+        cookie = (body.get("cookie") or "").strip()   # 手动粘贴则优先；留空走钥匙串
+        if not cookie and not secure_store.load_cookie():
+            self._json({"error": "平台已要求登录（字幕/PPT/视频直链均需登录态）："
+                                "请先点页面顶部「登录智云课堂」完成登录后再运行"}, 400)
+            return
         if body.get("save"):
-            save_config({"api_key": api_key, "cookie": cookie})
+            try:
+                if api_key:
+                    secure_store.save_api_key(api_key)   # 存钥匙串，不落明文文件
+                secure_store.save_api_config(
+                    json.dumps(provider, ensure_ascii=False))
+            except Exception as e:
+                self._json({"error": f"密钥存入钥匙串失败：{e}"}, 500)
+                return
 
         with JOBS_LOCK:
             JOB_COUNTER[0] += 1
@@ -679,13 +914,16 @@ class Handler(BaseHTTPRequestHandler):
                   (body.get("video_url") or "").strip(),
                   (body.get("summary_prompt") or "").strip(),
                   (body.get("upload_id") or "").strip(),
-                  (body.get("extra_requirements") or "").strip()),
+                  (body.get("extra_requirements") or "").strip(),
+                  provider,
+                  body.get("fetch_ppt", True)),
             daemon=True)
         t.start()
         self._json({"job_id": jid})
 
 
 def main():
+    migrate_secrets()          # 旧明文 key/cookie → 钥匙串，config.json 抹除
     server, port = None, PORT
     for cand in range(PORT, PORT + 6):        # 端口被占就自动顺延
         try:

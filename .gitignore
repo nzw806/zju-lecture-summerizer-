@@ -1,0 +1,18 @@
+# 个人凭证，绝不入库
+config.json
+
+# 运行产物
+output/
+uploads/
+server.log
+
+# 自动下载的 ffmpeg 二进制（约 20MB，不入库）
+bin/
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
