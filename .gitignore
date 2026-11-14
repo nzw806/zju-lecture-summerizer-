@@ -13,6 +13,9 @@ bin/
 __pycache__/
 *.pyc
 
+# macOS 本地生成的启动器
+*.app/
+
 # 系统
 .DS_Store
 Thumbs.db
