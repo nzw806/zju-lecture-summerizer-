@@ -103,14 +103,26 @@ def _log(progress, msg):
 # ---------------------------------------------------------------- URL 解析
 
 def parse_url(url):
-    """从 livingroom 回放 URL 里提取 course_id / sub_id / tenant_code。"""
+    """从回放 URL 里提取 course_id / sub_id / tenant_code。
+    兼容两种形态：
+      ① classroom.zju.edu.cn/livingroom?course_id=..&sub_id=..（query 直接带参）
+      ② interactivemeta.cmc.zju.edu.cn/#/replay?course_id=..&sub_id=..
+        （hash 路由：参数在 # 后面的 fragment 里）"""
     try:
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        u = urllib.parse.urlparse(url.strip())
+        q = urllib.parse.parse_qs(u.query)
+        if not q.get("sub_id"):
+            frag = u.fragment or ""
+            fq = frag.split("?", 1)[1] if "?" in frag else ""
+            q = urllib.parse.parse_qs(fq)
     except Exception:
         raise PipelineError("URL 无法解析，请粘贴浏览器地址栏的完整链接")
     sub_id = q.get("sub_id", [None])[0]
     if not sub_id:
-        raise PipelineError("URL 里找不到 sub_id 参数，请确认是 livingroom 回放页地址")
+        raise PipelineError(
+            "URL 里找不到 sub_id 参数。请确认是回放页地址，支持两种形如：\n"
+            "  · classroom.zju.edu.cn/livingroom?course_id=...&sub_id=...\n"
+            "  · interactivemeta.cmc.zju.edu.cn/#/replay?course_id=...&sub_id=...")
     return {
         "course_id": q.get("course_id", [""])[0],
         "sub_id": sub_id,
