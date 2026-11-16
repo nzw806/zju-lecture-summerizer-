@@ -462,12 +462,12 @@ document.getElementById('login').onclick = async () => {
   const btn = document.getElementById('login');
   const st = document.getElementById('lcstate');
   btn.disabled = true;
-  st.textContent = '正在打开登录窗口…（首次会弹钥匙串授权框，请点"允许"）';
+  st.textContent = '正在准备登录组件（首次约 190MB，自动安装）并打开登录窗口…';
   await fetch('/api/login', {method:'POST'});
   loginTimer = setInterval(async ()=>{
     const j = await (await fetch('/api/login-status')).json();
     if (j.login_state === 'running'){
-      st.textContent = '登录中… ' + (j.login_logs && j.login_logs.slice(-1)[0] || '');
+      st.textContent = (j.login_logs && j.login_logs.slice(-1)[0]) || '登录中…';
       return;
     }
     clearInterval(loginTimer);

@@ -76,22 +76,94 @@ def _cookies_to_header(context, origin):
     return "; ".join(pairs)
 
 
-def _interactive_login(progress=None):
-    """弹出浏览器让用户登录，成功后返回 Cookie 字符串。"""
+def _py_exe():
+    """当前解释器的可执行路径（供 subprocess 调 pip/playwright 用）。"""
+    import sys
+    return sys.executable or "python3"
+
+
+def _run_stream(cmd, log, what):
+    """跑安装命令，实时把输出喂给 log。返回 (ok, 尾部输出)。"""
+    import subprocess
+    log(f"正在{what}…")
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True,
+                             bufsize=1)
+    except Exception as e:
+        return False, str(e)
+    tail = []
+    for line in p.stdout or []:
+        line = line.rstrip()
+        if line:
+            tail = (tail + [line])[-3:]
+            # 只显示关键行，避免刷屏
+            low = line.lower()
+            if any(k in low for k in ("downloading", "installing", "installed",
+                                      "successfully", "error", "failed",
+                                      "mb", "已", "下载", "安装")):
+                log("   " + line[:100])
+    rc = p.wait()
+    return rc == 0, " | ".join(tail)
+
+
+def ensure_playwright(progress=None):
+    """确保 playwright 包与 chromium 内核就绪；缺失则自动安装。
+    全程日志提示。失败抛 LoginError。"""
+    def log(m):
+        if progress:
+            progress(m)
+        else:
+            print(m)
+
+    try:
+        import playwright                       # noqa: F401
+        from playwright.sync_api import sync_playwright   # noqa: F401
+        log("Playwright 已就绪")
+    except ImportError:
+        ok, tail = _run_stream(
+            [_py_exe(), "-m", "pip", "install", "--upgrade", "playwright"],
+            log, "安装 Playwright（约 40MB，只需一次）")
+        if not ok:
+            raise LoginError(
+                f"Playwright 安装失败：{tail}\n"
+                "可手动运行：pip install playwright")
+
+    # 官方没有可靠的"是否已装"CLI；直接尝试启动，失败再下载更稳妥
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise LoginError(
-            "未安装 Playwright，无法弹出登录窗口。请在终端运行一次：\n"
-            "    pip install playwright\n"
-            "    python -m playwright install chromium\n"
-            "或在界面里改用「手动粘贴 Cookie」。")
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            b.close()
+        log("Chromium 内核已就绪")
+        return
+    except Exception as e:
+        msg = str(e)
+        if "Executable doesn't exist" not in msg and "not installed" not in msg.lower():
+            # 不是"没装浏览器"的错（可能是环境问题），交由上层处理
+            log(f"Chromium 启动异常：{msg[:120]}")
+            return
+        log("首次使用：下载 Chromium 内核（约 150MB，只需一次）…")
+        ok, tail = _run_stream(
+            [_py_exe(), "-m", "playwright", "install", "chromium"],
+            log, "下载 Chromium 浏览器内核")
+        if not ok:
+            raise LoginError(
+                f"Chromium 下载失败：{tail}\n"
+                "可手动运行：python -m playwright install chromium")
 
+
+def _interactive_login(progress=None):
+    """弹出浏览器让用户登录，成功后返回 Cookie 字符串。
+    Playwright / Chromium 缺失时自动安装（首次约 190MB，之后跳过）。"""
     def log(msg):
         if progress:
             progress(msg)
         else:
             print(msg)
+
+    ensure_playwright(progress)
+    from playwright.sync_api import sync_playwright
 
     log("正在打开内置浏览器登录窗口…")
     with sync_playwright() as p:
@@ -100,7 +172,7 @@ def _interactive_login(progress=None):
         except Exception as e:
             raise LoginError(
                 f"启动内置浏览器失败：{e}\n"
-                "请先运行：python -m playwright install chromium")
+                "可手动运行：python -m playwright install chromium")
         context = browser.new_context(user_agent=UA)
         page = context.new_page()
         try:

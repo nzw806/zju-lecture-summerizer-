@@ -59,9 +59,10 @@ Whisper 识别使用**中性提示词**（只在有课件时补本课术语，�
 
 1. **AI key 需自备**（DeepSeek 默认，也可选智谱/千问/OpenAI 或自定义；一节课几毛钱）；
    不填则进入"只抓字幕"模式。
-2. **首次点「登录」会弹出内置浏览器窗口** → 对着浙大官方页登录一次；
+2. **首次点「登录」会自动安装登录组件**（Playwright + Chromium，约 190MB，
+   日志实时显示进度，装完自动弹登录窗口）→ 对着浙大官方页登录一次；
    登录态写入系统钥匙串时 macOS 会弹授权框 → 点"允许"（建议"始终允许"）。
-   想用弹窗登录需先装可选依赖：`pip install playwright && python -m playwright install chromium`。
+   不想自动装也可手动：`pip install playwright && python -m playwright install chromium`。
 3. **未来高精 Whisper 模式**首次使用需联网下载 ffmpeg 与模型（约 3GB）。
 
 手动方式（等价）：
